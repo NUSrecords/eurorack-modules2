@@ -37,6 +37,13 @@ namespace rings {
 using namespace std;
 using namespace stmlib;
 
+// ADC Offset calibration constant (hardware adjustment value)
+static const float kADCOffsetCalibration = 67.11476f;
+
+// String mode attack envelope parameters
+static const int32_t kStringAttackSamples = 48;      // ~1.0ms at 48kHz
+static const int32_t kStringAttackLUTRange = 1280;   // First quarter of sine LUT
+
 void Part::Init(uint16_t* reverb_buffer) {
   active_voice_ = 0;
   
@@ -51,10 +58,6 @@ void Part::Init(uint16_t* reverb_buffer) {
     excitation_filter_[i].Init();
     plucker_[i].Init();
     dc_blocker_[i].Init(1.0f - 10.0f / kSampleRate);
-
-       // VAŠE NOVÉ ŘÁDKY PŘIPSANÉ SEM:
-    string_wave_phase_[i] = 0.0f;
-    modal_wave_phase_[i] = 0.0f;
   }
   
   reverb_.Init(reverb_buffer);
@@ -90,7 +93,7 @@ void Part::ConfigureResonators() {
     case RESONATOR_MODEL_STRING_AND_REVERB:
       {
         float lfo_frequencies[kNumStrings] = {
-          0.554301f, 0.461915f, 0.369535f, 0.277152f, 0.230958f, 0.184762f, 0.138575f
+          0.5f, 0.4f, 0.35f, 0.23f, 0.211f, 0.2f, 0.171f
         };
         for (int32_t i = 0; i < kNumStrings; ++i) {
           bool has_dispersion = model_ == RESONATOR_MODEL_STRING || \
@@ -307,53 +310,14 @@ void Part::RenderModalVoice(
     float frequency,
     float filter_cutoff,
     size_t size) {
-  
-  // Ošetření proti zacyklení/HardFaultu při nulové nebo neinicializované frekvenci
-  float safe_freq = frequency > 0.00001f ? frequency : 0.001f;
-
-  if (performance_state.internal_exciter) {
-    if (voice == active_voice_ && performance_state.strum) {
-      // Při novém Strumu odstartujeme obálku z čisté nuly
-      modal_wave_phase_[voice] = 0.0f;
-    }
-
-    // Výpočet kroku fáze: chceme projít celou tabulku (1024 prvků) za 1 periodu tónu
-    float phase_step = safe_freq * (1024.0f / kSampleRate);
-
-    for (size_t i = 0; i < size; ++i) {
-      float modal_envelope = 0.0f;
-
-      if (voice == active_voice_) {
-        float lut_index = modal_wave_phase_[voice];
-
-        // 1. ATTACK (Prvních 25% periody = index 0 až 256) -> Stoupá z 0 na 1
-        if (lut_index < 256.0f) {
-          modal_envelope = stmlib::Interpolate(rings::lut_sine, lut_index, 1024.0f);
-          modal_wave_phase_[voice] += phase_step;
-        }
-        // 2. DECAY (Dalších 25% periody = index 256 až 512) -> Klesá z 1 na 0
-        else if (lut_index >= 256.0f && lut_index < 512.0f) {
-          // Čteme tabulku zrcadlově zpět, abychom hladce klesali dolů
-          float mirror_index = 512.0f - lut_index;
-          if (mirror_index < 0.0f) mirror_index = 0.0f;
-          modal_envelope = stmlib::Interpolate(rings::lut_sine, mirror_index, 1024.0f);
-          modal_wave_phase_[voice] += phase_step;
-        }
-        // 3. ZBYTEK PERIODY (Index 512 a více) -> Obálka je trvale na čisté nule
-        else {
-          modal_envelope = 0.0f;
-        }
-      }
-
-      // Výpočet původního exitačního impulsu od Émilie
-      float base_impulse = 0.25f * SemitonesToRatio(filter_cutoff * filter_cutoff * 24.0f) / filter_cutoff;
-      
-      // Modulace obálkou a zápis do buzení rezonátoru
-      if (voice == active_voice_) {
-        resonator_input_[i] += base_impulse * modal_envelope;
-      }
-    }
+  // Internal exciter is a pulse, pre-filter.
+  if (performance_state.internal_exciter &&
+      voice == active_voice_ &&
+      performance_state.strum) {
+    resonator_input_[0] += 0.25f * SemitonesToRatio(
+        filter_cutoff * filter_cutoff * 24.0f) / filter_cutoff;
   }
+  
   // Process through filter.
   excitation_filter_[voice].Process<FILTER_MODE_LOW_PASS>(
       resonator_input_, resonator_input_, size);
@@ -390,6 +354,35 @@ void Part::RenderFMVoice(
   v.Process(resonator_input_, out_buffer_, aux_buffer_, size);
 }
 
+// Helper function: Compute sine-based attack envelope for String mode
+// Returns smooth envelope from 0.0 to 1.0 over attack_samples
+inline float ComputeStringAttackEnvelope(
+    size_t sample_index,
+    int32_t attack_samples) {
+  if (sample_index >= attack_samples) {
+    return 1.0f;  // After attack phase, full amplitude
+  }
+  
+  // Normalized progress: 0.0 → 1.0
+  float progress = static_cast<float>(sample_index) / 
+                   static_cast<float>(attack_samples);
+  
+  // Clamp to [0.0, 1.0] range (defensive)
+  progress = (progress < 0.0f) ? 0.0f : (progress > 1.0f) ? 1.0f : progress;
+  
+  // Use sine lookup table for smooth curve (0 to π/2 = first quarter)
+  // LUT_SINE has 5121 entries covering full 2π
+  // First quarter = indices 0-1280
+  int32_t lut_index = static_cast<int32_t>(progress * kStringAttackLUTRange);
+  lut_index = (lut_index < 0) ? 0 : (lut_index > kStringAttackLUTRange ? 
+              kStringAttackLUTRange : lut_index);
+  
+  float envelope = rings::lut_sine[lut_index];
+  
+  // Safety: ensure output is normalized to [0, 1]
+  return (envelope < 0.0f) ? 0.0f : (envelope > 1.0f) ? 1.0f : envelope;
+}
+
 void Part::RenderStringVoice(
     int32_t voice,
     const PerformanceState& performance_state,
@@ -397,7 +390,7 @@ void Part::RenderStringVoice(
     float frequency,
     float filter_cutoff,
     size_t size) {
-  
+  // Compute number of strings and frequency.
   int32_t num_strings = 1;
   float frequencies[kNumStrings];
 
@@ -427,47 +420,38 @@ void Part::RenderStringVoice(
     }
   }
 
-  // 1. Zpracování externího vstupu (zůstává beze změny)
+  // Process external input.
   excitation_filter_[voice].Process<FILTER_MODE_LOW_PASS>(
       resonator_input_, resonator_input_, size);
 
-  float safe_freq = frequency > 0.00001f ? frequency : 0.001f;
-
+  // Add noise burst.
   if (performance_state.internal_exciter) {
     if (voice == active_voice_ && performance_state.strum) {
-      // Trigger původního pluckeru - určí délku decay šumu podle tónu
       plucker_[voice].Trigger(frequency, filter_cutoff * 8.0f, patch.position);
-      // Reset fáze pro sinusový náběh (Attack)
-      string_wave_phase_[voice] = 0.0f;
     }
-    
-    // Vygenerujeme surový šum do noise bufferu
     plucker_[voice].Process(noise_burst_buffer_, size);
-    
-    // Krok fáze pro čtvrtvlnu (0 až 256 prvků tabulky za jednu periodu tónu)
-    float phase_step = safe_freq * (1024.0f / kSampleRate);
-
     for (size_t i = 0; i < size; ++i) {
-      float attack_envelope = 1.0f;
-      
-      if (voice == active_voice_) {
-        float lut_index = string_wave_phase_[voice];
-        
-        if (lut_index < 256.0f) {
-          // 1. ATTACK: Prvních 25% periody tónu stoupáme po sinusovce
-          attack_envelope = stmlib::Interpolate(rings::lut_sine, lut_index, 1024.0f);
-          string_wave_phase_[voice] += phase_step;
-        } else {
-          // 2. DOSÁHNUTO VRCHOLU: Zafixujeme obálku na 1.0f!
-          // Šum už není dál utlumován náběhem a o zbytek dozvuku (Decay) se postará plucker!
-          attack_envelope = 1.0f;
-        }
-      }
-      
-      // Přičteme vytvarovaný šum do vstupu rezonátoru
-      resonator_input_[i] += noise_burst_buffer_[i] * attack_envelope;
+      resonator_input_[i] += noise_burst_buffer_[i];
     }
+
+    // ============================================================
+    // STRING MODE: SINE ATTACK ENVELOPE
+    // Smooth onset synchronized with tone frequency
+    // Applied only to active voice during internal excitation
+    // ============================================================
+    if (voice == active_voice_) {
+      for (size_t i = 0; i < size; ++i) {
+        float attack_envelope = ComputeStringAttackEnvelope(
+            i, 
+            kStringAttackSamples);
+        
+        // Apply envelope to noise burst
+        resonator_input_[i] *= attack_envelope;
+      }
+    }
+    // ============================================================
   }
+  
   dc_blocker_[voice].Process(resonator_input_, size);
   
   fill(&out_buffer_[0], &out_buffer_[size], 0.0f);

@@ -40,7 +40,7 @@
 
 namespace rings {
 
-const size_t kDelayLineSize = 2048;
+const size_t kDelayLineSize = 4096;
 
 class DampingFilter {
  public:

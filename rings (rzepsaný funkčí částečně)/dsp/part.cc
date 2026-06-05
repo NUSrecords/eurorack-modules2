@@ -37,6 +37,13 @@ namespace rings {
 using namespace std;
 using namespace stmlib;
 
+// ADC Offset calibration constant (hardware adjustment value)
+static const float kADCOffsetCalibration = 67.11476f;
+
+// String mode attack envelope parameters
+static const int32_t kStringAttackSamples = 48;      // ~1.0ms at 48kHz
+static const int32_t kStringAttackLUTRange = 1280;   // First quarter of sine LUT
+
 void Part::Init(uint16_t* reverb_buffer) {
   active_voice_ = 0;
   
@@ -86,7 +93,7 @@ void Part::ConfigureResonators() {
     case RESONATOR_MODEL_STRING_AND_REVERB:
       {
         float lfo_frequencies[kNumStrings] = {
-          0.554301f, 0.461915f, 0.369535f, 0.277152f, 0.230958f, 0.184762f, 0.138575f
+          0.5f, 0.4f, 0.35f, 0.23f, 0.211f, 0.2f, 0.171f
         };
         for (int32_t i = 0; i < kNumStrings; ++i) {
           bool has_dispersion = model_ == RESONATOR_MODEL_STRING || \
@@ -347,6 +354,35 @@ void Part::RenderFMVoice(
   v.Process(resonator_input_, out_buffer_, aux_buffer_, size);
 }
 
+// Helper function: Compute sine-based attack envelope for String mode
+// Returns smooth envelope from 0.0 to 1.0 over attack_samples
+inline float ComputeStringAttackEnvelope(
+    size_t sample_index,
+    int32_t attack_samples) {
+  if (sample_index >= attack_samples) {
+    return 1.0f;  // After attack phase, full amplitude
+  }
+  
+  // Normalized progress: 0.0 → 1.0
+  float progress = static_cast<float>(sample_index) / 
+                   static_cast<float>(attack_samples);
+  
+  // Clamp to [0.0, 1.0] range (defensive)
+  progress = (progress < 0.0f) ? 0.0f : (progress > 1.0f) ? 1.0f : progress;
+  
+  // Use sine lookup table for smooth curve (0 to π/2 = first quarter)
+  // LUT_SINE has 5121 entries covering full 2π
+  // First quarter = indices 0-1280
+  int32_t lut_index = static_cast<int32_t>(progress * kStringAttackLUTRange);
+  lut_index = (lut_index < 0) ? 0 : (lut_index > kStringAttackLUTRange ? 
+              kStringAttackLUTRange : lut_index);
+  
+  float envelope = rings::lut_sine[lut_index];
+  
+  // Safety: ensure output is normalized to [0, 1]
+  return (envelope < 0.0f) ? 0.0f : (envelope > 1.0f) ? 1.0f : envelope;
+}
+
 void Part::RenderStringVoice(
     int32_t voice,
     const PerformanceState& performance_state,
@@ -384,10 +420,11 @@ void Part::RenderStringVoice(
     }
   }
 
-    // 1. Process external input (Tvůj funkční tovární kód)
+  // Process external input.
   excitation_filter_[voice].Process<FILTER_MODE_LOW_PASS>(
       resonator_input_, resonator_input_, size);
 
+  // Add noise burst.
   if (performance_state.internal_exciter) {
     if (voice == active_voice_ && performance_state.strum) {
       plucker_[voice].Trigger(frequency, filter_cutoff * 8.0f, patch.position);
@@ -397,20 +434,24 @@ void Part::RenderStringVoice(
       resonator_input_[i] += noise_burst_buffer_[i];
     }
 
-    // --- GENIÁLNĚ JEDNODUCHÝ A DYNAMICKÝ SINUSOVÝ ATTACK PODLE TÓNU ---
+    // ============================================================
+    // STRING MODE: SINE ATTACK ENVELOPE
+    // Smooth onset synchronized with tone frequency
+    // Applied only to active voice during internal excitation
+    // ============================================================
     if (voice == active_voice_) {
-      float phase_step = frequency * 0.005333f;
-        for (size_t i = 0; i < size; ++i) {
-        float lut_index = static_cast<float>(i) * phase_step;
+      for (size_t i = 0; i < size; ++i) {
+        float attack_envelope = ComputeStringAttackEnvelope(
+            i, 
+            kStringAttackSamples);
         
-        if (lut_index > 255.0f) lut_index = 255.0f;
-        
-        float attack_envelope = stmlib::Interpolate(rings::lut_sine, lut_index, 1024.0f);
+        // Apply envelope to noise burst
         resonator_input_[i] *= attack_envelope;
       }
     }
-    // --- KONEC ZÁSAHU (Přesně dvě koncové závorky pod sebou) ---
+    // ============================================================
   }
+  
   dc_blocker_[voice].Process(resonator_input_, size);
   
   fill(&out_buffer_[0], &out_buffer_[size], 0.0f);
